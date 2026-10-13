@@ -1,98 +1,33 @@
-# KeyCRM → Trello
+# KeyCRM to Trello
 
-Синхронізація етапу воронки KeyCRM з колонкою Trello. Картки читаються з OpenAPI воронки і розкладаються за мапінгом статусів.
+When a deal moves to another stage in a KeyCRM pipeline, the matching Trello card moves to the column with the same meaning.
 
-**Стек.** Python, KeyCRM OpenAPI, Trello.
+## Problem
 
-Публічний кейс. Робоча копія з паролями і базами лишається локально і сюди не входить.
+Sales lived in KeyCRM and delivery tracking lived in Trello. Someone was dragging the Trello card by hand after every stage change, and the two boards drifted.
 
----
+## What was built
 
-# KeyCRM -> Trello Status Sync
+A sync job that reads pipeline cards from KeyCRM OpenAPI and moves Trello cards to the column named for that status.
 
-Автоматична синхронізація зміни **статусу (етапу воронки)** картки KeyCRM у відповідну **колонку** Trello.
+Important detail: the reader uses `GET /v1/pipelines/cards`, not `/leads`. On the accounts this was built for, `/leads` answered 405. The pipeline id is `KEYCRM_PIPELINE_ID` in the env file. The map from KeyCRM status id to the exact Trello list name is `config/keycrm_status_map.json`. Keys are status ids. Values must match the Trello list title character for character.
 
-Дані беруться з офіційного OpenAPI KeyCRM: **`GET /v1/pipelines/cards`** (картки воронки), а не з `/leads` — останній у багатьох акаунтів дає **405 Method Not Allowed**.
+## How it works
 
-## Воронка та статуси KeyCRM
+On each run the job loads cards for the configured pipeline, reads the current status id, looks up the Trello list name, and moves the card if it is not already there. A test folder is included for the mapping. Logs stay on the machine that runs the job.
 
-- У `.env` задається **ID воронки**: `KEYCRM_PIPELINE_ID=1`.
-- Відповідність **ID статусу KeyCRM → назва колонки Trello** задається у `config/keycrm_status_map.json` (ключ — лише ID з CRM, значення — **точна** назва списку на дошці).
+## Stack
 
-Поточний мапінг (згідно з вашим описом):
+Python, KeyCRM OpenAPI, Trello API.
 
-| ID статусу KeyCRM | Колонка Trello |
-|-------------------|----------------|
-| 1 | Новий лід |
-| 2 | В роботі |
-| 3 | Очікуємо оплату |
-| 12 | Оплачено |
-| 13 | Виробництво |
-| 16 | Передано на склад |
-| 14 | Відправлено |
-| 15 | Отримано |
-
-**ТЗ:** назви колонок у Trello мають **один в один** збігатися з цими рядками (порівняння після `strip` і нормалізації регістру). Якщо колонки немає або є дві з однаковою назвою — синхронізація для відповідних статусів не виконується, у лог пишеться помилка.
-
-## Помилка «Немає колонки Trello … Передано на склад»
-
-На дошці має бути **окремий список** з назвою **точно** `Передано на склад` (як у KeyCRM). Якщо колонки немає або назва відрізняється (пробіл, літера) — додайте/перейменуйте список у Trello.
-
-## У логах `status_id=5` для колонки «В роботі»
-
-У частини акаунтів KeyCRM етап **«В роботі»** має **`status_id=5`**, а не `2`. У `config/keycrm_status_map.json` додано обидва варіанти (`"2"` та `"5"` → «В роботі»). Якщо у вас інші id — подивіться **Налаштування → Воронки** або `GET /v1/pipelines/1/statuses` і оновіть JSON.
-
-## Чому заявка була в KeyCRM, а в Trello порожньо
-
-Раніше агент лише **переміщував** уже наявні картки Trello (за `lead_id` у описі) і **не створював** нові. Тепер за замовчуванням він **створює** картку при першій появі картки воронки в API, якщо для її `status_id` є колонка в мапінгу і вона існує на дошці.
-
-## Телефон і `Missing phone`
-
-За замовчуванням картки **без телефону** не блокують роботу: у лог пишеться попередження, синхронізація статусу йде далі. Якщо потрібна жорстка перевірка — у `.env` встановіть `KEYCRM_REQUIRE_PHONE=true`.
-
-Телефон шукається в `contact`, `contact.phones[]`, `contact.client` тощо (KeyCRM віддає структури по-різному).
-
-## Дошка Trello «Моя дошка Trello»
-
-Назва дошки в коді не використовується — потрібен **`TRELLO_BOARD_ID`**. Його можна взяти з URL дошки у браузері: `https://trello.com/b/<BOARD_ID>/...`
-
-## Що реалізовано
-
-- Завантаження карток воронки через `GET /pipelines/cards` з `filter[pipeline_id]=…`, пагінація `limit=50` (максимум API).
-- **Якщо в Trello ще немає картки** з маркером `lead_id:<id>` у описі — агент **створює** картку в колонці, що відповідає поточному `status_id` (за замовчуванням увімкнено). Вимкнути: `SYNC_AUTO_CREATE_TRELLO_CARDS=false` у `.env`.
-- Синхронізація за зміною **`status_id`** етапу в KeyCRM.
-- Переміщення картки у колонку з ID, отриманим з Trello API за **назвою** колонки з мапінгу.
-- **Єдиний** ключ ідентифікації картки в Trello: `lead_id` = **ID картки воронки** KeyCRM (`pipelines/cards`), окремий рядок `lead_id:<id>` у описі (порівняння **по рядку**, щоб `lead_id:1` не плутався з `lead_id:10`, `11`, …).
-- Якщо в Trello вже є картка з **такою ж назвою**, але **без** рядка `lead_id:…` (наприклад, створена іншою CRM), агент **дописує** блок KeyCRM у опис і **не створює** дублікат.
-- У кожному циклі **оновлюється опис** картки з полів KeyCRM (клієнт, телефон, email, статус, менеджер тощо), колонка **підганяється** під поточний статус у CRM.
-- Перевірка дублікатів: за `lead_id` у описі та за назвою картки.
-- Логування запусків і помилок (`logs/sync.log`).
-- Валідація: `lead_id`, `name`, `phone`, `status_id`.
-
-## Налаштування
-
-1. `cp .env.example .env`
-2. Заповніть токени та `TRELLO_BOARD_ID`, `KEYCRM_PIPELINE_ID=1`.
-3. За потреби відредагуйте `config/keycrm_status_map.json` (тільки якщо зміняться ID або назви колонок).
-
-## Запуск
+## Run locally
 
 ```bash
-python3 -m src.main
+cp .env.example .env
 ```
 
-## Тести
+Set the KeyCRM token, the pipeline id, and the Trello key, token, and board. Then run the sync entrypoint in `src/`. Adjust `config/keycrm_status_map.json` to your funnel before the first real run.
 
-```bash
-python3 -m unittest discover -s test -p "test_*.py" -v
-```
+## What this public copy leaves out
 
-## ТЗ (коротка формалізація)
-
-1. Ідентифікація картки в Trello — **тільки** за `lead_id`.
-2. Відповідність етапів: **ID статусу KeyCRM** ↔ **одна колонка Trello** з назвою з мапінгу.
-3. При зміні `status_id` картка переміщується у відповідний список; при дублікатах або відсутності мапінгу — переміщення не виконується, фіксується помилка.
-
-## Безпека ключів
-
-Тримайте `KEYCRM_API_TOKEN`, `TRELLO_API_KEY` та `TRELLO_TOKEN` лише в `.env`, не публікуйте їх у чатах і репозиторії.
+`.env` and log files.
